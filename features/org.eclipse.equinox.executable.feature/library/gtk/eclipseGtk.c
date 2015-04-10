@@ -71,48 +71,6 @@ static void catch_signal(int sig) {
 	raise(sig);
 }
 
-typedef int (*LockFunc)();
-int executeWithLock(char *name, LockFunc func) {
-	int result = -1;
-	int lock = -1;
-	struct sigaction action;
-
-	mutex = sem_open(name, O_CREAT | O_EXCL, S_IRWXU | S_IRWXG | S_IRWXO, 1);
-	if (mutex == SEM_FAILED) {
-		//create failed. Probably lock is already created so try opening the existing lock.
-		mutex = sem_open(name, 0);
-	}
-	if (mutex == SEM_FAILED)
-		return -1; //this is an error.
-
-	// install signal handler to free the lock if something bad happens.
-	// sem_t is not freed automatically when a process ends.
-	action.sa_handler = catch_signal;
-	sigaction(SIGINT, &action, &intAction);
-	sigaction(SIGQUIT, &action, &quitAction);
-
-	while ((lock = sem_trywait(mutex)) != 0) {
-		if (errno == EAGAIN) {
-			//couldn't acquire lock, sleep a bit and try again
-			sleep(1);
-			if (--openFileTimeout > 0)
-				continue;
-		}
-		break;
-	}
-
-	if (lock == 0)
-		result = func();
-
-	sem_post(mutex);
-	sem_close(mutex);
-
-	//reinstall the original signal handlers
-	sigaction(SIGINT, &intAction, NULL);
-	sigaction(SIGQUIT, &quitAction, NULL);
-	return result;
-}
-
 /* Create a "SWT_Window_" + APP_NAME string with optional suffix.
  * Caller should free the memory when finished */
 static char * createSWTWindowString(char * suffix, int semaphore) {
@@ -131,7 +89,7 @@ static char * createSWTWindowString(char * suffix, int semaphore) {
 	return result;
 }
 
-static int setAppWindowPropertyFn() {
+static int setAppWindowProperty() {
 	Window appWindow;
 	Atom propAtom;
 	_TCHAR *propVal;
@@ -143,21 +101,12 @@ static int setAppWindowPropertyFn() {
 		//append a colon delimiter in case more than one file gets appended to the app windows property.
 		propVal = concatPaths(openFilePath, _T_ECLIPSE(':'));
 		gtk.XChangeProperty(gtk_GDK_DISPLAY, appWindow, propAtom, propAtom, 8, PropModeAppend, (unsigned char *)propVal, _tcslen(propVal));
+		gtk.XSync(gtk_GDK_DISPLAY, False);
 		free(propVal);
 		windowPropertySet = 1;
 		return 1;
 	}
 	return 0;
-}
-
-/* set the Application window property by executing _setWindowPropertyFn within a semaphore */
-int setAppWindowProperty() {
-	int result;
-	char * mutexName = createSWTWindowString(NULL, 1);
-	result = executeWithLock(mutexName, setAppWindowPropertyFn);
-	gtk.XSync(gtk_GDK_DISPLAY, False);
-	free(mutexName);
-	return result;
 }
 
 /* timer callback function to call setAppWindowProperty */
@@ -169,22 +118,45 @@ static gboolean setAppWindowTimerProc(gpointer data) {
 
 int createLauncherWindow() {
 	Window window, launcherWindow;
+	/* XGrabServer prevents other X clients from interrupting between
+	 * testing for an existing selection owner (XGetSelectionOwner) and
+	 * and setting a new selection owner.
+	 * Note: This is heavyweight X server wide mutual exclusion, use with care.
+	 */
+	gtk.XGrabServer(gtk_GDK_DISPLAY);
 	//check if a launcher window exists. If none exists, we know we are the first and we should be launching the app.
 	window = gtk.XGetSelectionOwner(gtk_GDK_DISPLAY, launcherWindowAtom);
 	if (window == 0) {
 		//create a launcher window that other processes can find.
 		launcherWindow = gtk.XCreateWindow(gtk_GDK_DISPLAY, gtk.XRootWindow(gtk_GDK_DISPLAY, gtk.XDefaultScreen(gtk_GDK_DISPLAY)), -10, -10, 1,
 				1, 0, 0, InputOnly, CopyFromParent, (unsigned long) 0, (XSetWindowAttributes *) NULL);
-		//for some reason Set and Get are both necessary. Set alone does nothing.
+		if(launcherWindow==0) {
+			gtk.XUngrabServer(gtk_GDK_DISPLAY);
+			return 1;
+		}
 		gtk.XSetSelectionOwner(gtk_GDK_DISPLAY, launcherWindowAtom, launcherWindow, CurrentTime);
-		gtk.XGetSelectionOwner(gtk_GDK_DISPLAY, launcherWindowAtom);
+		gtk.XUngrabServer(gtk_GDK_DISPLAY);
+		// final check to see that everything worked.  This should only fail
+		// if another client isn't playing nice (not using XGrabServer).
+		if(gtk.XGetSelectionOwner(gtk_GDK_DISPLAY, launcherWindowAtom)!=launcherWindow)
+			return 1;
 		//add a timeout to set the property on the apps window once the app is launched.
 		gtk.g_timeout_add(1000, setAppWindowTimerProc, 0);
 		return 0;
 	}
+	gtk.XUngrabServer(gtk_GDK_DISPLAY);
 	return 1;
 }
 
+/* This call checks for the presence of another instance of this product
+ * and, if found, sends a message with a file name string to be opened.
+ * Implemented using the X11 Selection IPC mechanism (aka the X clipboard).
+ *
+ * See Selections in chapter #4 of
+ * http://www.x.org/releases/current/doc/libX11/libX11/libX11.html
+ * Also chapter #2 of
+ * http://www.x.org/releases/current/doc/xorg-docs/icccm/icccm.html
+ */
 int reuseWorkbench(_TCHAR** filePath, int timeout) {
 	char *appName, *launcherName;
 	int result = 0;
@@ -195,7 +167,7 @@ int reuseWorkbench(_TCHAR** filePath, int timeout) {
 	openFileTimeout = timeout;
 	openFilePath = filePath;
 	
-	//App name is defined in SWT as well. Values must be consistent.
+	//App name is defined in SWT (Display.java) as well. Values must be consistent.
 	appName = createSWTWindowString(NULL, 0);
 	appWindowAtom = gtk.XInternAtom(gtk_GDK_DISPLAY, appName, FALSE);
 	free(appName);
@@ -207,7 +179,7 @@ int reuseWorkbench(_TCHAR** filePath, int timeout) {
 	/* app is not running, create a launcher window to act as a mutex so we don't need to keep the semaphore locked */
 	launcherName = createSWTWindowString(_T_ECLIPSE("_Launcher"), 1);
 	launcherWindowAtom = gtk.XInternAtom(gtk_GDK_DISPLAY, launcherName, FALSE);
-	result = executeWithLock(launcherName, createLauncherWindow);
+	result = createLauncherWindow();
 	free(launcherName);
 
 	if (result == 1) {

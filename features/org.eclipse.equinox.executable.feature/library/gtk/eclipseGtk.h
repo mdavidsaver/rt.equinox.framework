@@ -60,6 +60,8 @@ struct GTK_PTRS {
 	int			(*XDefaultScreen)			(Display*);
 	Window		(*XRootWindow)				(Display*, int);
 	Atom 		(*XInternAtom)				(Display*, _Xconst char*, Bool	);
+	void		(*XGrabServer)				(Display*);
+	void		(*XUngrabServer)			(Display*);
 };
 
 #define gtk_GDK_DISPLAY gtk.gdk_x11_display_get_xdisplay(gtk.gdk_display_get_default())

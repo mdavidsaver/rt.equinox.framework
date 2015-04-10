@@ -75,6 +75,8 @@ static FN_TABLE x11Functions[] = {
 	FN_TABLE_ENTRY(XRootWindow, 1),
 	FN_TABLE_ENTRY(XDefaultScreen, 1),
 	FN_TABLE_ENTRY(XInternAtom, 1),
+	FN_TABLE_ENTRY(XGrabServer, 1),
+	FN_TABLE_ENTRY(XUngrabServer, 1),
 	{ NULL, NULL }
 };
 
